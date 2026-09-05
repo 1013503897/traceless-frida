@@ -1,0 +1,13 @@
+# build artifacts
+*.so
+*.o
+test/tlf_target
+native/libtracelessfrida.so
+
+# python
+__pycache__/
+*.pyc
+
+# editor / os
+.DS_Store
+*.swp

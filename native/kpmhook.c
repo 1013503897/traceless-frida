@@ -1,0 +1,574 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// libkpmhook: LSPlant InitInfo inline_hooker/unhooker backed by the stealth KPM
+// (shpte) over the no-superkey syscall bridge. See kpmhook.h for the contract.
+//
+// Per page we build ONE position-independent whole-page DBI clone (lib/dbi) and
+// drive the KPM's multi-page `pghook` table: the first hook on a page arms it
+// (UXN + clone + offmap), each later hook on the same page appends an override.
+// `pgunhook` removes one override and disarms the page when its last one goes.
+// The clone is a normal anonymous RX mmap (CRC-clean: the target .text is never
+// modified; the clone is visible in /proc/maps -- the maps-hide hook covers that
+// separately). Original execution is rerouted into the clone by the kernel fault
+// router; the KPM only reads our offmap, never the clone bytes.
+
+#include <android/log.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
+
+#include "dbi.h"
+#include "kpmhook.h"
+
+#define BRIDGE_MAGIC 0x5348505442524447ULL /* "SHPTBRDG" -- matches kpm/shpte.c */
+/* Bridge carrier syscall = sysinfo (arm64 #179), NOT personality: Android's app
+ * seccomp filter arg-filters personality() (blocks our magic arg with ERRNO), so the
+ * personality bridge is unreachable from real zygote-forked app processes. sysinfo is
+ * seccomp-allowed with arbitrary args and rarely called. Must match kpm/shpte.c BRIDGE_NR. */
+#define BRIDGE_NR 179
+
+#define PAGE_SZ 0x1000UL
+#define PAGE_INSN 1024              /* instructions in one 4 KiB page */
+#define CLONE_CAP 6144             /* characterize: one fn (<=2048 insns) can expand ~5x */
+#define MAX_RGN_PAGES 64           /* RV-2: must not exceed the KPM's MAX_RGN (64: reach farther clean boundaries) */
+#define RGN_INSN_MAX (MAX_RGN_PAGES * PAGE_INSN) /* 65536 region source insns */
+#define RGN_CLONE_CAP (RGN_INSN_MAX * 6)         /* clone scratch: ~5x expansion + headroom */
+#define KPM_MAX_REGIONS 16         /* must not exceed the KPM's MAX_PG */
+#define KPM_MAX_OV 8               /* must not exceed the KPM's MAX_OV */
+
+struct ov {
+    uint64_t off;   /* REGION-relative byte offset of the hooked entry */
+    void *replace;  /* the hooker */
+    void *backup;   /* in-clone faithful copy of the target */
+};
+
+/* RV-2: a clean-bounded MULTI-PAGE region [base, end) cloned in one piece, so a
+ * function spanning a page boundary is wholly contained in the clone and RETs
+ * normally. Offsets are region-relative. offmap is malloc'd (region-sized). */
+struct rgn {
+    int used;
+    uint64_t base;            /* R_lo: region base page */
+    uint64_t end;             /* R_hi: base + npages*0x1000 (exclusive, a clean boundary) */
+    int npages;
+    void *clone;              /* whole-region DBI clone: RX mmap (legacy) or RW source (ghost) */
+    size_t clone_sz;          /* mmap size (page-rounded) */
+    int clone_words;          /* DBI clone insn count (offmap targets index into this) */
+    uint32_t *offmap;         /* malloc'd, nmap entries (read by the KPM via access_process_vm) */
+    int nmap;                 /* npages*1024 */
+    /* Rev1-(1): ghost main-path -- host the recompiled clone in VMA-less kernel memory
+     * (pghookg) instead of an anon RX mmap, so it is unreachable by maps/mincore enumeration.
+     * `clone` then stays a plain RW buffer the KPM copies from at arm; routing runs from
+     * ghost_va. See kpm/shpte.c do_pghook (ghost path). */
+    int ghost;                /* 1 = this region's clone lives at ghost_va (VMA-less) */
+    uint64_t ghost_va;        /* chosen currently-unmapped VA for the ghost clone region */
+    struct ov ov[KPM_MAX_OV];
+    int nov;                  /* live overrides in this region */
+};
+
+static struct rgn g_rgns[KPM_MAX_REGIONS];
+static uint32_t g_clonebuf[CLONE_CAP]; /* characterize dbi scratch, reused under g_lock */
+static uint32_t g_scratch_omap[CLONE_CAP]; /* characterize dbi offmap scratch, under g_lock */
+/* static .bss buffer handed to the KPM's access_process_vm (reused under g_lock): the
+ * KPM copies it into its own vmalloc immediately, so this need not persist. Scudo's
+ * high mmap-region heap pages are NOT GUP-readable by access_process_vm (got=0), but a
+ * .bss address is -- so the offmap to pass the KPM lives here, not on the malloc heap. */
+static uint32_t g_pass_offmap[RGN_INSN_MAX];
+static int g_pid = 0;
+static int g_inited = 0;      /* 1 = bridge verified live + this process is gated-in */
+static int g_init_failed = 0; /* 1 = gate rejected us or bridge was off (don't re-probe) */
+static int g_force_enable = 0; /* standalone/test bypass of the process gate (NOT used by Vector) */
+static int g_mode_read = 0;
+static int g_characterize = 0; /* 1 = dry-run: log a span census, arm nothing */
+/* Rev1-(1): ghost main-path toggle (kpm_hook_set_ghost). When on, every new region is
+ * hosted in VMA-less kernel memory (pghookg) and no anon RX clone mmap is created. Off by
+ * default so the proven userspace-clone path is unchanged until a caller opts in. */
+static int g_ghost = 0;
+static uint64_t g_ghost_cursor = 0; /* monotonic VA allocator for ghost regions (under g_lock) */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define KPM_LOG_TAG "kpmhook"
+
+/* Process gate: engage the KPM backend only in the process named by the system
+ * property `persist.kpmhook.target` (matched against /proc/self/cmdline), so that
+ * system_server / zygote / every other injected process stay on pure Dobby. The
+ * standalone test harness calls kpm_hook_force_enable() to bypass this (it has no
+ * Dobby fallback and runs its own dedicated process). */
+static int proc_is_target(void)
+{
+    if (g_force_enable) return 1;
+    char cmd[256];
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t r = read(fd, cmd, sizeof(cmd) - 1);
+    close(fd);
+    if (r <= 0) return 0;
+    cmd[r] = 0; /* args are NUL-separated; the first token is the process name */
+#ifdef KPM_TARGET_UID
+    /* At LSPlant::Init/HookInline time the cmdline is still "zygote64" (the app name is
+     * set later, in the app's main), so a cmdline gate can't identify the process there.
+     * The UID is already specialized, though -- so gate on it (e.g. 2000 = the shell-UID
+     * parasitic LSPosed manager host). */
+    if ((int)getuid() == KPM_TARGET_UID) return 1;
+#endif
+#ifdef KPM_RV0_TARGET
+    /* compile-time target: SELinux-proof (an untrusted_app cannot read a custom
+     * persist.* prop on modern Android). Defined only for the RV-0 characterize build. */
+    if (strcmp(cmd, KPM_RV0_TARGET) == 0) return 1;
+#endif
+#ifdef KPM_TARGET
+    /* compile-time target for REAL hooking (no characterize) -- gate the KPM region
+     * clones to this one process; system_server / everything else stays on Dobby. */
+    if (strcmp(cmd, KPM_TARGET) == 0) return 1;
+#endif
+    char target[PROP_VALUE_MAX];
+    if (__system_property_get("persist.kpmhook.target", target) > 0 && strcmp(cmd, target) == 0)
+        return 1;
+    return 0;
+}
+
+/* Whether to run the dry-run census instead of arming hooks. The RV-0 build forces
+ * it on at compile time (SELinux-proof -- an injected app cannot read a custom
+ * persist.* prop); otherwise it is opt-in via persist.kpmhook.mode=characterize. */
+static int is_characterize(void)
+{
+    if (!g_mode_read) {
+#ifdef KPM_RV0_TARGET
+        g_characterize = 1; /* RV-0 build: always dry-run -- arm nothing, just census */
+#else
+        char mode[PROP_VALUE_MAX];
+        g_characterize =
+            (__system_property_get("persist.kpmhook.mode", mode) > 0 && strcmp(mode, "characterize") == 0);
+#endif
+        g_mode_read = 1;
+    }
+    return g_characterize;
+}
+
+/* Instruction count from `entry` to the first RET / unconditional tail B (heuristic
+ * function end -- enough for a page-span census). Bounded read to limit over-read
+ * past the .text segment. */
+static int fn_len_insns(uintptr_t entry)
+{
+    const uint32_t *p = (const uint32_t *)entry;
+    const int cap = 2048; /* 8 KiB scan cap */
+    for (int i = 0; i < cap; i++) {
+        uint32_t w = p[i];
+        if (w == 0xD65F03C0u) return i + 1;             /* RET */
+        if ((w & 0xFC000000u) == 0x14000000u) return i + 1; /* unconditional B (tail) -- heuristic end */
+    }
+    return cap;
+}
+
+/* Dry-run census for one LSPlant target: how far the function reaches and whether it
+ * spans page boundaries (the whole-page clone breaks on page-spanning funcs). Arms
+ * nothing; logs one logcat line under tag "kpmhook". */
+static void characterize_target(void *target)
+{
+    uintptr_t t = (uintptr_t)target;
+    uint64_t page = (uint64_t)(t & ~(PAGE_SZ - 1));
+    uint64_t off = (uint64_t)(t & (PAGE_SZ - 1));
+    int len = fn_len_insns(t);
+    uint64_t end = t + (uint64_t)len * 4;
+    int pages = (int)((end - 1) / PAGE_SZ - t / PAGE_SZ + 1);
+    int rc = dbi_recompile(t, (const uint32_t *)t, len + 4, g_clonebuf, CLONE_CAP, g_scratch_omap,
+                           CLONE_CAP);
+    __android_log_print(ANDROID_LOG_INFO, KPM_LOG_TAG,
+                        "census target=%p page=0x%lx off=0x%lx len=%d end=0x%lx pages=%d dbi_rc=%d%s",
+                        target, (unsigned long)page, (unsigned long)off, len, (unsigned long)end,
+                        pages, rc, pages > 1 ? " SPANS" : "");
+}
+
+/* Run a KPM command through the bridge. Fills `out` (NUL-terminated). Returns the KPM
+ * rc. If the bridge is OFF this is a real sysinfo() call with a bogus struct pointer
+ * (BRIDGE_MAGIC) -> harmless EFAULT, no side effects (unlike personality, which would
+ * have clobbered the process persona). */
+static long bridge_cmd(const char *cmd, char *out, size_t outlen)
+{
+    if (out && outlen) out[0] = 0;
+    return syscall(BRIDGE_NR, BRIDGE_MAGIC, cmd, (long)strlen(cmd) + 1, out, (long)outlen);
+}
+
+static int reply_ok(const char *out) { return out[0] == 'o' && out[1] == 'k'; }
+
+/* Init under g_lock. Probe the bridge: if it is armed the KPM swallows our magic
+ * sysinfo() and fills `out`; if not, the real sysinfo(BRIDGE_MAGIC,...) EFAULTs and
+ * `out` stays empty (no cleanup needed). */
+static int ensure_init_locked(void)
+{
+    if (g_inited) return 0;
+    if (g_init_failed) return -1; /* gated out or bridge off -- don't re-probe */
+    if (!proc_is_target()) {      /* process gate: only the named test process engages the KPM */
+        g_init_failed = 1;
+        return -1;
+    }
+    char out[128];
+    bridge_cmd("probe", out, sizeof out);
+    if (out[0] == 0) {
+        g_init_failed = 1;
+        return -1;
+    }
+    g_pid = (int)getpid();
+    g_inited = 1;
+    return 0;
+}
+
+/* A page boundary `b` is clean if no function straddles it: the last word before b
+ * is a RET / unconditional tail-B / padding (NOP/0). Conservative heuristic -- if it
+ * misjudges "not clean" we just expand; if it wrongly judges "clean" the region would
+ * cut a function, which the clean-boundary scan is designed to avoid. */
+static int clean_boundary(uint64_t b)
+{
+    uint32_t w = ((const uint32_t *)(uintptr_t)b)[-1]; /* word at b-4 */
+    if (w == 0xD65F03C0u) return 1;                  /* RET */
+    if (w == 0xD503201Fu || w == 0) return 1;        /* NOP / zero padding */
+    if ((w & 0xFC000000u) == 0x14000000u) return 1;  /* unconditional B (tail call) */
+    return 0;
+}
+
+/* Region whose [base,end) contains `target`. Because end is always a clean boundary,
+ * EVERY function starting in [base,end) also ends in it -- so a target found here is
+ * fully contained and reuse is always safe (append override). */
+static struct rgn *find_rgn_locked(uint64_t target)
+{
+    for (int i = 0; i < KPM_MAX_REGIONS; i++)
+        if (g_rgns[i].used && target >= g_rgns[i].base && target < g_rgns[i].end) return &g_rgns[i];
+    return 0;
+}
+
+/* lowest existing-region base in (base,cap), or 0 -- so make_rgn never expands into
+ * (and overlaps) an already-armed region. */
+static uint64_t next_rgn_base_locked(uint64_t base, uint64_t cap)
+{
+    uint64_t lo = 0;
+    for (int i = 0; i < KPM_MAX_REGIONS; i++) {
+        if (!g_rgns[i].used) continue;
+        uint64_t rb = g_rgns[i].base;
+        if (rb > base && rb < cap && (lo == 0 || rb < lo)) lo = rb;
+    }
+    return lo;
+}
+
+/* Bounds of the contiguous READABLE mapping containing `addr` (extends across adjacent
+ * readable VMAs): returns the extent END, sets *out_start to the extent START, or 0 if
+ * addr is not in a readable mapping. Two uses, both against hardened/packed libs (e.g.
+ * GCash's libAPSE) that split their .text with non-readable --xp/---p sub-ranges:
+ *   1. cap region expansion at [.,end) so dbi_recompile's [base,end) read stays readable;
+ *   2. bound dbi's LDR-literal-pool reads to [start,end) so a bytecode word MISDECODED as
+ *      an LDR-literal (obfuscated VM) resolving OUTSIDE the readable extent is SKIPPED, not
+ *      read -- that out-of-extent read (e.g. base-486KB, below libAPSE) SIGSEGVs otherwise.
+ * Reads /proc/self/maps (sleepable install context only, never the fault path); maps are
+ * address-sorted. */
+static uint64_t readable_extent(uint64_t addr, uint64_t *out_start)
+{
+    if (out_start) *out_start = 0;
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return 0;
+    char line[256];
+    uint64_t start = 0, end = 0;
+    while (fgets(line, sizeof line, f)) {
+        uint64_t lo, hi;
+        char perms[8];
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3) continue;
+        if (end == 0) {
+            if (addr >= lo && addr < hi && perms[0] == 'r') { start = lo; end = hi; } /* containing readable VMA */
+        } else if (lo == end && perms[0] == 'r') {
+            end = hi;         /* extend across a contiguous readable VMA */
+        } else if (lo >= end) {
+            break;            /* gap or non-readable neighbor -> stop */
+        }
+    }
+    fclose(f);
+    if (out_start) *out_start = start;
+    return end;
+}
+
+/* Rev1-(1): true if [va, va+sz) overlaps ANY current VMA in /proc/self/maps. Used to
+ * validate a ghost-region VA candidate against live mappings (the KPM re-checks and falls
+ * back on any residual collision). Conservative (returns "mapped") if maps can't be read. */
+static int va_range_mapped(uint64_t va, size_t sz)
+{
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return 1;
+    char line[256];
+    int hit = 0;
+    uint64_t end = va + sz;
+    while (fgets(line, sizeof line, f)) {
+        uint64_t lo, hi;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) continue;
+        if (va < hi && lo < end) { hit = 1; break; } /* ranges overlap */
+    }
+    fclose(f);
+    return hit;
+}
+
+/* Rev1-(1): choose a currently-unmapped VA of `sz` bytes for a ghost clone region. Anchors
+ * in the middle of the LARGEST /proc/self/maps gap on first use (a multi-GB hole on arm64,
+ * far from anything the allocator hands out soon), then bumps a monotonic cursor so
+ * successive ghost regions -- which are themselves VMA-less and thus invisible to a maps
+ * re-scan -- never overlap each other. Verifies each candidate against live VMAs. Returns 0
+ * if no gap is found (caller then arms the legacy userspace-clone path). Called under g_lock.
+ * (§5 get_unmapped_area pinning would make this collision-proof; for Rev1 the KPM's unmapped
+ * check + Dobby/userspace-clone fallback covers the rare race.) */
+static uint64_t pick_ghost_va(size_t sz)
+{
+    sz = (sz + PAGE_SZ - 1) & ~(PAGE_SZ - 1);
+    if (!g_ghost_cursor) {
+        FILE *f = fopen("/proc/self/maps", "re");
+        if (!f) return 0;
+        char line[256];
+        uint64_t prev_end = 0x100000, best_lo = 0, best_hi = 0;
+        while (fgets(line, sizeof line, f)) {
+            uint64_t lo, hi;
+            if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) continue;
+            if (lo > prev_end && (lo - prev_end) > (best_hi - best_lo)) { best_lo = prev_end; best_hi = lo; }
+            if (hi > prev_end) prev_end = hi;
+        }
+        fclose(f);
+        if (best_hi - best_lo < (uint64_t)sz + 0x100000) return 0; /* no usable gap */
+        g_ghost_cursor = (best_lo + (best_hi - best_lo) / 2) & ~(PAGE_SZ - 1);
+    }
+    for (int tries = 0; tries < 64; tries++) {
+        uint64_t cand = g_ghost_cursor;
+        g_ghost_cursor += sz + PAGE_SZ; /* advance past this region + a guard page */
+        if (cand && !va_range_mapped(cand, sz)) return cand;
+    }
+    return 0;
+}
+
+/* Build a clean-bounded multi-page region clone covering `target`. R_lo = target's
+ * page; expand R_hi to the next clean boundary (capped at MAX_RGN_PAGES and at any
+ * existing region). Returns a populated entry, or NULL -> caller falls back to Dobby. */
+static struct rgn *make_rgn_locked(uint64_t target)
+{
+    uint64_t base = target & ~(PAGE_SZ - 1);
+    uint64_t cap = base + (uint64_t)MAX_RGN_PAGES * PAGE_SZ;
+    uint64_t collide = next_rgn_base_locked(base, cap);
+    if (collide) cap = collide; /* don't overlap an existing region */
+    /* never expand into a non-readable page: dbi_recompile reads [base,end) to build the
+     * clone, and packed libs (libAPSE) split .text with non-readable sub-ranges -> a read
+     * there SIGSEGVs (the flaky getColorInfo install crash). Cap at base's readable extent
+     * and reuse the same [rd_start,rd_end) to bound dbi's literal-pool reads below. */
+    uint64_t rd_start = 0;
+    uint64_t rd_end = readable_extent(base, &rd_start);
+    if (!rd_end) return 0;      /* base itself not readable -> Dobby (can't clone) */
+    if (rd_end < cap) cap = rd_end;
+    uint64_t end = base + PAGE_SZ;
+    while (end < cap && !clean_boundary(end)) end += PAGE_SZ;
+    if (!clean_boundary(end)) return 0; /* no clean boundary in budget -> Dobby */
+
+    int npages = (int)((end - base) / PAGE_SZ);
+    int n = npages * PAGE_INSN;
+    uint32_t *offmap = malloc((size_t)n * 4);
+    uint32_t *scratch = malloc((size_t)RGN_CLONE_CAP * 4);
+    if (!offmap || !scratch) { free(offmap); free(scratch); return 0; }
+
+    /* bound LDR-literal pool reads to base's READABLE extent (not a blind +/-8 MiB): an
+     * obfuscated-VM word misdecoded as an LDR-literal that resolves outside [rd_start,rd_end)
+     * is skipped instead of dereferenced (that out-of-extent read SIGSEGVs on packed libs). */
+    int csz = dbi_recompile_range(base, (const uint32_t *)(uintptr_t)base, n, scratch, RGN_CLONE_CAP,
+                                  offmap, n, (uintptr_t)rd_start, (uintptr_t)rd_end);
+    if (csz < 0) { free(offmap); free(scratch); return 0; }
+
+    size_t sz = ((size_t)csz * 4 + (PAGE_SZ - 1)) & ~(PAGE_SZ - 1);
+    void *clone = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (clone == MAP_FAILED) { free(offmap); free(scratch); return 0; }
+    memcpy(clone, scratch, (size_t)csz * 4);
+    free(scratch);
+    /* ghost mode: leave the clone a plain RW buffer (GUP-readable source; the KPM copies it
+     * into VMA-less kernel memory and does its own I-cache sync -- no anon RX mapping ever
+     * exists). legacy mode: flip it to RX for in-place execution, as before. */
+    if (!g_ghost) {
+        __builtin___clear_cache((char *)clone, (char *)clone + sz);
+        if (mprotect(clone, sz, PROT_READ | PROT_EXEC) != 0) { munmap(clone, sz); free(offmap); return 0; }
+    }
+
+    uint64_t ghost_va = 0;
+    if (g_ghost) {
+        ghost_va = pick_ghost_va(sz);
+        if (!ghost_va) { munmap(clone, sz); free(offmap); return 0; } /* no VA -> caller falls back */
+    }
+
+    struct rgn *e = 0;
+    for (int i = 0; i < KPM_MAX_REGIONS; i++)
+        if (!g_rgns[i].used) { e = &g_rgns[i]; break; }
+    if (!e) { munmap(clone, sz); free(offmap); return 0; } /* registry full */
+    e->base = base; e->end = end; e->npages = npages;
+    e->clone = clone; e->clone_sz = sz; e->clone_words = csz;
+    e->offmap = offmap; e->nmap = n;
+    e->ghost = g_ghost; e->ghost_va = ghost_va;
+    e->nov = 0; e->used = 1;
+    return e;
+}
+
+static void add_ov_locked(struct rgn *e, uint64_t off, void *replace, void *backup)
+{
+    for (int i = 0; i < e->nov; i++)
+        if (e->ov[i].off == off) { /* re-hook: update in place */
+            e->ov[i].replace = replace;
+            e->ov[i].backup = backup;
+            return;
+        }
+    if (e->nov >= KPM_MAX_OV) return; /* KPM rejected too; backup still valid */
+    e->ov[e->nov].off = off;
+    e->ov[e->nov].replace = replace;
+    e->ov[e->nov].backup = backup;
+    e->nov++;
+}
+
+static void remove_ov_locked(struct rgn *e, uint64_t off)
+{
+    for (int i = 0; i < e->nov; i++)
+        if (e->ov[i].off == off) {
+            for (int j = i; j < e->nov - 1; j++) e->ov[j] = e->ov[j + 1];
+            e->nov--;
+            return;
+        }
+}
+
+void kpm_hook_force_enable(void) { g_force_enable = 1; }
+
+void kpm_hook_set_ghost(int on) { g_ghost = on ? 1 : 0; }
+
+/* Enable the kernel fs-hide for THIS process: arm the statfs/mountinfo hooks and register our own
+ * tgid in the KPM hide-set, so this app's statfs f_type reads overlayfs->erofs and its mountinfo/
+ * mounts drop the overlay/magisk lines -- defeats the "hidden overlayfs" mount detection. Reader-
+ * gated to our tgid only (root's own views stay truthful). Idempotent; call once from
+ * postAppSpecialize (like set_ghost). No-op/harmless on a pre-0.6.6 KPM (reply != "ok"). */
+void kpm_hook_fshide_enable(void)
+{
+    pthread_mutex_lock(&g_lock);
+    if (ensure_init_locked() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return; /* gated out or bridge off -- nothing to do */
+    }
+    char cmd[64], out[256];
+    bridge_cmd("fshide on", out, sizeof out);
+    snprintf(cmd, sizeof cmd, "fshide add %d", g_pid);
+    bridge_cmd(cmd, out, sizeof out);
+    pthread_mutex_unlock(&g_lock);
+}
+
+int kpm_hook_init(void)
+{
+    pthread_mutex_lock(&g_lock);
+    int rc = ensure_init_locked();
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
+void *kpm_inline_hooker(void *target, void *hooker)
+{
+    void *backup = 0;
+    pthread_mutex_lock(&g_lock);
+    if (ensure_init_locked() != 0) goto out;
+
+    /* dry-run characterize mode: measure the function's page-span, arm nothing,
+     * return NULL so the caller (Vector) falls back to Dobby and the app stays
+     * functional. This is the crash-safe RV-0 path. */
+    if (is_characterize()) {
+        characterize_target(target);
+        goto out;
+    }
+
+    uintptr_t t = (uintptr_t)target;
+    struct rgn *e = find_rgn_locked(t); /* reuse the region if target is inside one (always fits) */
+    if (!e) e = make_rgn_locked(t);
+    if (!e) {
+#ifdef KPM_DEBUG
+        fprintf(stderr, "[kpm] make_rgn NULL for target=0x%lx\n", (unsigned long)t);
+#endif
+        goto out; /* >MAX_RGN_PAGES with no clean boundary, or alloc failure -> Dobby */
+    }
+
+    uint64_t roff = t - e->base; /* region-relative offset */
+    /* backup = the in-clone faithful copy of the target. Legacy: inside the RX mmap.
+     * Ghost: inside the VMA-less region at ghost_va (the KPM maps the same clone there). */
+    uint64_t clone_base = e->ghost ? e->ghost_va : (uint64_t)(uintptr_t)e->clone;
+    backup = (char *)(uintptr_t)(clone_base + (uint64_t)e->offmap[roff / 4] * 4);
+
+    /* hand the KPM a .bss copy of the offmap (its heap original isn't GUP-readable) */
+    memcpy(g_pass_offmap, e->offmap, (size_t)e->nmap * 4);
+
+    char cmd[224], out[256];
+    if (e->ghost)
+        /* pghookg: clone hosted VMA-less at ghost_va; `clone` is the RW source, clone_words
+         * its size (offmap targets index into it). See kpm/shpte.c do_pghook (ghost path). */
+        snprintf(cmd, sizeof cmd, "pghookg %d 0x%lx 0x%lx 0x%lx %lu 0x%lx 0x%lx 0x%lx %lu", g_pid,
+                 (unsigned long)e->base, (unsigned long)(uintptr_t)e->clone,
+                 (unsigned long)(uintptr_t)g_pass_offmap, (unsigned long)e->nmap, (unsigned long)roff,
+                 (unsigned long)(uintptr_t)hooker, (unsigned long)e->ghost_va,
+                 (unsigned long)e->clone_words);
+    else
+        snprintf(cmd, sizeof cmd, "pghook %d 0x%lx 0x%lx 0x%lx %lu 0x%lx 0x%lx", g_pid,
+                 (unsigned long)e->base, (unsigned long)(uintptr_t)e->clone,
+                 (unsigned long)(uintptr_t)g_pass_offmap, (unsigned long)e->nmap, (unsigned long)roff,
+                 (unsigned long)(uintptr_t)hooker);
+    bridge_cmd(cmd, out, sizeof out);
+#ifdef KPM_DEBUG
+    fprintf(stderr, "[kpm] rgn base=0x%lx npages=%d clone=%p nmap=%d roff=0x%lx cmd=[%s] reply=[%s]\n",
+            (unsigned long)e->base, e->npages, e->clone, e->nmap, (unsigned long)roff, cmd, out);
+#endif
+    if (!reply_ok(out)) {
+        /* surface the KPM's exact reject reply to logcat (e.g. "error: ghost inject failed
+         * rc=-6") -- the one diagnostic worth having when a device test can't be re-run cheaply */
+        __android_log_print(ANDROID_LOG_WARN, KPM_LOG_TAG, "hook reject: cmd=[%s] reply=[%s]", cmd, out);
+        /* If this region was FRESHLY made for this hook (no live overrides yet), the KPM never
+         * armed it -- release the clone mmap + offmap and free the registry slot so a rejected hook
+         * doesn't leak a region. A REUSED region (nov>0) still backs other live hooks -> keep it.
+         * `clone` is an mmap in both legacy and ghost mode, so munmap is always correct. */
+        if (e->nov == 0) {
+            munmap(e->clone, e->clone_sz);
+            free(e->offmap);
+            e->used = 0;
+        }
+        backup = 0;
+        goto out;
+    }
+
+    add_ov_locked(e, roff, hooker, backup);
+
+out:
+    pthread_mutex_unlock(&g_lock);
+    return backup;
+}
+
+int kpm_inline_unhooker(void *func)
+{
+    int ok = 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g_inited) goto out;
+
+    uintptr_t f = (uintptr_t)func;
+    struct rgn *e = find_rgn_locked(f);
+    if (!e) goto out; /* not a KPM-hooked function -> caller uses Dobby */
+    uint64_t roff = f - e->base; /* region-relative */
+
+    char cmd[128], out[256];
+    snprintf(cmd, sizeof cmd, "pgunhook %d 0x%lx 0x%lx", g_pid, (unsigned long)e->base,
+             (unsigned long)roff);
+    bridge_cmd(cmd, out, sizeof out);
+    ok = reply_ok(out);
+    if (ok) remove_ov_locked(e, roff); /* keep the clone/offmap until shutdown */
+
+out:
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+void kpm_hook_shutdown(void)
+{
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < KPM_MAX_REGIONS; i++) {
+        if (!g_rgns[i].used) continue;
+        if (g_rgns[i].clone) munmap(g_rgns[i].clone, g_rgns[i].clone_sz);
+        free(g_rgns[i].offmap);
+        memset(&g_rgns[i], 0, sizeof(g_rgns[i]));
+    }
+    pthread_mutex_unlock(&g_lock);
+}
