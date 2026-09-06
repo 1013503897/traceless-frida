@@ -19,3 +19,11 @@ cp ../stealth-poc/lib/{kpmhook.c,kpmhook.h,dbi.c,dbi.h,aarch64_decode.h} native/
 If the `kpm_*` signatures or the `pghook`/`pgunhook` bridge wire format change, update
 `native/tlf_api.c` and `agent/traceless.js` accordingly (the JS side only depends on the
 five `tlf_*` exports, so most backend drift is absorbed by `tlf_api.c`).
+
+## Local deviations from upstream
+
+`native/kpmhook.c` carries **one intentional, comment-only** deviation from the stealth-poc
+original: a couple of comments referenced a specific commercial target app/lib by name as an
+example of a hardened/packed `.text`; here they are genericized ("some commercial packers" /
+"the packed lib") since this is a general-purpose public project. No code changes. **After a
+`cp` re-sync, re-apply this genericization** (or fix it upstream and re-vendor).
