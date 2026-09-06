@@ -4,7 +4,7 @@
 `native/aarch64_decode.h` are copied **verbatim** from the canonical source repo:
 
 - **stealth-poc** — `lib/kpmhook.{c,h}`, `lib/dbi.{c,h}`, `lib/aarch64_decode.h`
-- provenance: commit `f37b25b` (2026-09-05)
+- provenance: commit `3e65142` (kpmhook.c example comments genericized upstream)
 
 These are the same files [Vector](https://github.com/1013503897/Vector) vendors under
 `native/src/kpm/`. Keep them in lock-step with stealth-poc; do not fork them here. The
@@ -20,10 +20,8 @@ If the `kpm_*` signatures or the `pghook`/`pgunhook` bridge wire format change, 
 `native/tlf_api.c` and `agent/traceless.js` accordingly (the JS side only depends on the
 five `tlf_*` exports, so most backend drift is absorbed by `tlf_api.c`).
 
-## Local deviations from upstream
+## Deviations from upstream
 
-`native/kpmhook.c` carries **one intentional, comment-only** deviation from the stealth-poc
-original: a couple of comments referenced a specific commercial target app/lib by name as an
-example of a hardened/packed `.text`; here they are genericized ("some commercial packers" /
-"the packed lib") since this is a general-purpose public project. No code changes. **After a
-`cp` re-sync, re-apply this genericization** (or fix it upstream and re-vendor).
+None. The specific target-app names once present in `kpmhook.c` example comments were
+genericized **upstream** (stealth-poc `3e65142` — "some commercial packers" / "the packed
+lib"), so these files stay byte-identical to stealth-poc and a `cp` re-sync remains clean.
