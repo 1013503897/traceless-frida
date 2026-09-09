@@ -15,4 +15,4 @@ You should have received a copy of the GNU General Public License along with thi
 program; if not, see <https://www.gnu.org/licenses/gpl-2.0.html> for the full text.
 
 This project vendors GPL-2.0-or-later sources (kpmhook.c, dbi.c and headers) from the
-stealth-poc project; see SYNC.md. Each source file carries its own SPDX identifier.
+stealth-core project; see SYNC.md. Each source file carries its own SPDX identifier.

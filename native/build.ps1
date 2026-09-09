@@ -1,7 +1,7 @@
 # Build libtracelessfrida.so (arm64) with the NDK clang toolchain.
 #
 # This is an ORDINARY userspace Android shared library (unlike the shpte KPM, which
-# is a freestanding -O0 relocatable ELF -- see stealth-poc/kpm/build.ps1). Normal
+# is a freestanding -O0 relocatable ELF -- see stealth-core/kpm/build.ps1). Normal
 # -O2 is fine here; it links libc + liblog and is dlopen'd into the target by Frida.
 #
 # Usage: powershell native/build.ps1 [-Api 29] [-Out ..\libtracelessfrida.so]
@@ -11,7 +11,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-# NDK: honour ANDROID_NDK_HOME, fall back to the local dev default (same as stealth-poc).
+# NDK: honour ANDROID_NDK_HOME, fall back to the local dev default (same as stealth-core).
 $ndk = if ($env:ANDROID_NDK_HOME) { $env:ANDROID_NDK_HOME } else { "C:\Users\Administrator\AppData\Local\Android\Sdk\ndk\26.1.10909125" }
 $bin = Join-Path $ndk "toolchains\llvm\prebuilt\windows-x86_64\bin"
 $clang = Join-Path $bin "clang.exe"

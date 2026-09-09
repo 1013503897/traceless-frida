@@ -27,7 +27,7 @@ Stock Frida `Interceptor` installs an inline patch: an `rwx` trampoline and a mo
 
 **The hooked library's `.text` is never written.** Its maps stay byte-identical and non-writable. The write path lives in the kernel page-table shadow, not on the target.
 
-A small native shim (`libtracelessfrida.so`) is loaded into the process by Frida and drives the same `lib/kpmhook` / `lib/dbi` backend used elsewhere in this stack ([stealth-poc](https://github.com/1013503897/stealth-poc)). No full Frida rebuild is required.
+A small native shim (`libtracelessfrida.so`) is loaded into the process by Frida and drives the same `lib/kpmhook` / `lib/dbi` backend used elsewhere in this stack ([stealth-core](https://github.com/1013503897/stealth-core)). No full Frida rebuild is required.
 
 ### How it works
 
@@ -49,7 +49,7 @@ Native side (`native/`): `tlf_api.c` (five-symbol ABI) over vendored `kpmhook.c`
 
 ### Requirements
 
-- AArch64 Android with **APatch / KernelPatch**, **shpte KPM loaded**, and its **sysinfo bridge armed** (see [stealth-poc](https://github.com/1013503897/stealth-poc)). Runtime does **not** need a superkey — the bridge uses `sysinfo(179)`.
+- AArch64 Android with **APatch / KernelPatch**, **shpte KPM loaded**, and its **sysinfo bridge armed** (see [stealth-core](https://github.com/1013503897/stealth-core)). Runtime does **not** need a superkey — the bridge uses `sysinfo(179)`.
 - Matching `frida-server` on device and `frida` / `frida-tools` on the host.
 - Android NDK (r26 / 26.1 known-good) to build the `.so` and the test target.
 
@@ -123,10 +123,10 @@ docs/     DESIGN.md
 
 ### Related
 
-- [stealth-poc](https://github.com/1013503897/stealth-poc) — shpte KPM and the `lib/kpmhook` / `lib/dbi` backend this frontend drives
+- [stealth-core](https://github.com/1013503897/stealth-core) — shpte KPM and the `lib/kpmhook` / `lib/dbi` backend this frontend drives
 - [Vector](https://github.com/1013503897/Vector) — Zygisk ART-hook framework on the same KPM backend
 
-`native/kpmhook.c`, `dbi.c`, `dbi.h`, `kpmhook.h`, and `aarch64_decode.h` are vendored from **stealth-poc** — see [SYNC.md](SYNC.md). License: **GPL-2.0-or-later**.
+`native/kpmhook.c`, `dbi.c`, `dbi.h`, `kpmhook.h`, and `aarch64_decode.h` are vendored from **stealth-core** — see [SYNC.md](SYNC.md). License: **GPL-2.0-or-later**.
 
 ---
 
@@ -144,7 +144,7 @@ docs/     DESIGN.md
 
 **被 hook 的库 `.text` 一字不写**，maps 保持逐字节一致且不可写。写入发生在内核页表影子里，而不是覆盖目标本身。
 
-Frida 只需加载一个小的 native shim（`libtracelessfrida.so`），去驱动本仓库栈里同一套 `lib/kpmhook` / `lib/dbi` 后端（见 [stealth-poc](https://github.com/1013503897/stealth-poc)）。**不必重编整个 Frida。**
+Frida 只需加载一个小的 native shim（`libtracelessfrida.so`），去驱动本仓库栈里同一套 `lib/kpmhook` / `lib/dbi` 后端（见 [stealth-core](https://github.com/1013503897/stealth-core)）。**不必重编整个 Frida。**
 
 ### 工作原理
 
@@ -166,7 +166,7 @@ Native 侧（`native/`）：`tlf_api.c`（5 符号 ABI）+ vendored 的 `kpmhook
 
 ### 前置条件
 
-- AArch64 Android，已装 **APatch / KernelPatch**，**shpte KPM 已加载**且 **sysinfo 桥已武装**（见 [stealth-poc](https://github.com/1013503897/stealth-poc)）。运行期**不需要 superkey**，桥走 `sysinfo(179)`。
+- AArch64 Android，已装 **APatch / KernelPatch**，**shpte KPM 已加载**且 **sysinfo 桥已武装**（见 [stealth-core](https://github.com/1013503897/stealth-core)）。运行期**不需要 superkey**，桥走 `sysinfo(179)`。
 - 设备上有匹配的 `frida-server`，host 有 `frida` / `frida-tools`。
 - Android NDK（r26 / 26.1 已验证）用于编译 `.so` 和测试样本。
 
@@ -240,7 +240,7 @@ docs/     DESIGN.md
 
 ### 相关项目
 
-- [stealth-poc](https://github.com/1013503897/stealth-poc) — 本前端驱动的 shpte KPM 与 `lib/kpmhook` / `lib/dbi`
+- [stealth-core](https://github.com/1013503897/stealth-core) — 本前端驱动的 shpte KPM 与 `lib/kpmhook` / `lib/dbi`
 - [Vector](https://github.com/1013503897/Vector) — 同一 KPM 后端上的 Zygisk ART-hook 框架
 
-`native/kpmhook.c`、`dbi.c`、`dbi.h`、`kpmhook.h`、`aarch64_decode.h` 来自 **stealth-poc**（见 [SYNC.md](SYNC.md)）。许可证：**GPL-2.0-or-later**。
+`native/kpmhook.c`、`dbi.c`、`dbi.h`、`kpmhook.h`、`aarch64_decode.h` 来自 **stealth-core**（见 [SYNC.md](SYNC.md)）。许可证：**GPL-2.0-or-later**。

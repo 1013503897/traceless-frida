@@ -52,7 +52,7 @@ syscall(179, 0x5348505442524447 /* "SHPTBRDG" */, cmd_ptr, cmd_len, out_ptr, out
 
 `kpmhook.c` issues `pghook` / `pghookg` / `pgunhook` (and `probe`). A real `sysinfo()`
 (arg0 ≠ magic) passes straight through. See
-`stealth-poc/docs/bridge-protocol.md` for the wire contract.
+`stealth-core/docs/bridge-protocol.md` for the wire contract.
 
 ## The frontend ↔ backend ABI
 
