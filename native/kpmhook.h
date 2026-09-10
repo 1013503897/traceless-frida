@@ -59,6 +59,16 @@ void kpm_hook_set_ghost(int on);
 void kpm_hook_fshide_enable(void);
 
 /*
+ * Self-cloak THIS process's Frida-runtime footprint from /proc/self/maps: add the injected
+ * agent, Gum/ART JIT memfds and the openjdkjvmti plugin to the KPM general hide-set (hidergn)
+ * over the same sysinfo(179) bridge. Covers what traceless-frida leaves out of scope
+ * ("Frida's own presence (frida-agent maps)"), so a maps-scan inject-detector no longer counts
+ * them. View-only hide (no unmap). Idempotent. Returns #regions hidden. Re-call to catch
+ * lazily-created JIT memfds.
+ */
+int kpm_hook_selfcloak(void);
+
+/*
  * Probe the bridge and cache getpid(). Returns 0 if this process is gated-in AND the
  * bridge is live; <0 otherwise (gated out, or bridge not armed) -- in which case no
  * hook is attempted. Optional: kpm_inline_hooker() lazily runs this on first use.
