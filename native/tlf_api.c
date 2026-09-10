@@ -69,3 +69,15 @@ TLF_EXPORT void tlf_fshide(void)
 {
     kpm_hook_fshide_enable();
 }
+
+/*
+ * Optional: self-cloak Frida's OWN footprint. The traceless hook keeps the TARGET clean,
+ * but the injected frida-agent / Gum JIT / openjdkjvmti memfds still show in /proc/self/maps
+ * -- what a maps-scan inject-detector (counts executable/deleted memfd regions) kills on.
+ * This hides those regions via the KPM general hide-set. Returns #regions hidden. Call after
+ * tlf_init(); the JS side re-calls it on a timer to catch lazily-created JIT memfds.
+ */
+TLF_EXPORT int tlf_selfcloak(void)
+{
+    return kpm_hook_selfcloak();
+}
