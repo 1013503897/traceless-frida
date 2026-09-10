@@ -101,11 +101,31 @@ The harness checks **liveness** (`secret(n)` returns `orig + 1000`) and **tracel
 
 ### Tracelessness scope
 
-| Covered | Not covered |
+| Covered | Not covered by the hook itself |
 | :--- | :--- |
-| Target library: byte-identical, non-writable, no inline branch, no `rwx` on `.text` | `frida-agent` maps |
-| CRC / `/proc/maps` / `mincore` on the target | Your replacement (lives in Frida's gum allocator) |
-| With `ghost: true`, the recompiled clone is VMA-less | Hiding Frida itself (out of scope) |
+| Target library: byte-identical, non-writable, no inline branch, no `rwx` on `.text` | `frida-agent` maps — **opt-in via `selfCloak`** (below) |
+| CRC / `/proc/maps` / `mincore` on the target | Your replacement (lives in Frida's gum allocator) — hidden under `ghost: true` |
+| With `ghost: true`, the recompiled clone is VMA-less | Frida's *identity* strings/symbols — use a polymorphic `frida-server` build |
+
+### Frida-side stealth (`selfCloak` + build hardening)
+
+The traceless hook keeps the *target* clean; two extra, optional layers hide **Frida itself**:
+
+- **`selfCloak`** — `init({ selfCloak: true })` (or a bare `Traceless.selfCloak()`) walks this
+  process's `/proc/self/maps` and adds every Frida-runtime region — the injected agent's
+  random-named `/memfd:`, Gum's JIT `/memfd:`, and the `openjdkjvmti` plugin — to the KPM
+  general hide-set (`hidergn`) over the same `sysinfo(179)` bridge. A maps-scan inject-detector
+  that *counts executable/deleted memfd regions by type* (a random name does not help it) then
+  sees nothing. `{ selfCloak: { intervalMs } }` re-sweeps on a timer to catch lazily-created JIT
+  memfds. View-only hide, no unmap; verified end-to-end against a commercial maps-scan RASP
+  (agent memfds → `grep memfd /proc/<pid>/maps` == 0, process survives).
+- **Build hardening** — `native/build.ps1 -Name <random> [-Sanitize]`: `llvm-strip --strip-all`
+  drops internal symbol names, `-Name` randomizes the `.so`/soname (pass it as `init({ so })`),
+  and `-Sanitize` runs the self-contained `tools/sanitize.py` (length-preserving identity-token
+  rename; the KPM bridge verbs / getprop keys are excluded by design). No external obfuscator.
+
+> Note: this covers Frida's *own footprint*. For a full stack, pair it with a polymorphic,
+> string/symbol-sanitized `frida-server` so a memory scan for `frida`/`gum` also comes up empty.
 
 ### Safety
 
@@ -117,6 +137,7 @@ The harness checks **liveness** (`secret(n)` returns `orig + 1000`) and **tracel
 ```
 native/   tlf_api.c + vendored kpmhook/dbi + build.ps1  → libtracelessfrida.so
 agent/    traceless.js                                  Frida frontend
+tools/    sanitize.py                                   self-contained anti-fingerprint pass
 test/     target.c, test.js, run.py, build_target.ps1   end-to-end proof
 docs/     DESIGN.md
 ```

@@ -49,8 +49,9 @@ const SIG_GENERIC = {
 const Traceless = (function () {
     let soPath = DEFAULT_SO;
     let mod = null;
-    let fn = null;         // { init, hook, unhook, shutdown, fshide }
+    let fn = null;         // { init, hook, unhook, shutdown, fshide, selfcloak }
     let armed = false;
+    let cloakTimer = null; // setInterval id for the periodic self-cloak sweep
     const hooks = new Map(); // key = target hex -> { target, cb, orig, backup, spec }
 
     function loadBackend() {
@@ -68,7 +69,8 @@ const Traceless = (function () {
             hook: new NativeFunction(exp('tlf_hook'), 'pointer', ['pointer', 'pointer']),
             unhook: new NativeFunction(exp('tlf_unhook'), 'int', ['pointer']),
             shutdown: new NativeFunction(exp('tlf_shutdown'), 'void', []),
-            fshide: new NativeFunction(exp('tlf_fshide'), 'void', [])
+            fshide: new NativeFunction(exp('tlf_fshide'), 'void', []),
+            selfcloak: new NativeFunction(exp('tlf_selfcloak'), 'int', [])
         };
     }
 
@@ -76,7 +78,9 @@ const Traceless = (function () {
 
     // --- public API ---
 
-    // init({ so, ghost, fshide }) -> true; throws if the shpte bridge is not armed.
+    // init({ so, ghost, fshide, selfCloak }) -> true; throws if the shpte bridge is not armed.
+    //   selfCloak: true            -> cloak once now + a periodic sweep every 300ms (default)
+    //   selfCloak: { intervalMs }  -> same, custom sweep period; intervalMs<=0 = one-shot only
     function init(opts) {
         opts = opts || {};
         if (opts.so) soPath = opts.so;
@@ -88,7 +92,22 @@ const Traceless = (function () {
                 '). Is shpte loaded and the bridge on? (shctl <KEY> control shpte probe/bridge)');
         }
         if (opts.fshide) fn.fshide();
+        if (opts.selfCloak) {
+            const iv = (typeof opts.selfCloak === 'object' && 'intervalMs' in opts.selfCloak)
+                ? opts.selfCloak.intervalMs : 300;
+            selfCloak();                              // cover the startup maps-scan window
+            if (iv > 0 && !cloakTimer) cloakTimer = setInterval(selfCloak, iv);
+        }
         return true;
+    }
+
+    // Hide Frida's own footprint (agent / Gum JIT / jvmti memfds) from /proc/self/maps via
+    // the KPM. The traceless hook keeps the TARGET clean; this covers Frida's own presence,
+    // which is out of scope for the hook itself. Returns the number of regions hidden.
+    // Safe/idempotent to call repeatedly (re-call catches lazily-created JIT memfds).
+    function selfCloak() {
+        requireArmed();
+        return fn.selfcloak().valueOf();
     }
 
     function requireArmed() {
@@ -189,6 +208,7 @@ const Traceless = (function () {
     function dispose(opts) {
         if (!fn) return;
         opts = opts || {};
+        if (cloakTimer) { clearInterval(cloakTimer); cloakTimer = null; }
         for (const k of Array.from(hooks.keys())) {
             try { fn.unhook(ptr(k)); } catch (e) {}
         }
@@ -203,7 +223,7 @@ const Traceless = (function () {
         return Array.from(hooks.values()).map(r => ({ target: r.target.toString(), backup: r.backup.toString() }));
     }
 
-    return { init, replace, attach, revert, dispose, list, SIG_GENERIC, get armed() { return armed; } };
+    return { init, replace, attach, revert, dispose, list, selfCloak, SIG_GENERIC, get armed() { return armed; } };
 })();
 
 // Expose for REPL / cross-script (-l traceless.js -l yourscript.js) use.

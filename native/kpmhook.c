@@ -454,6 +454,54 @@ void kpm_hook_fshide_enable(void)
     pthread_mutex_unlock(&g_lock);
 }
 
+/* Self-cloak THIS process's Frida-runtime footprint. traceless-frida keeps the HOOKED
+ * TARGET byte-identical, but by documented scope does NOT hide Frida's own presence --
+ * the injected agent (a random-named executable /memfd:), Gum's JIT /memfd:, and the
+ * openjdkjvmti plugin .so all sit in /proc/self/maps. A maps-scan inject-detector counts
+ * anonymous/deleted executable memfd regions BY TYPE (a random name does not help), so
+ * those regions get the process killed. This walks our own maps and adds each such region
+ * to the KPM general hide-set (hidergn) over the SAME sysinfo(179) bridge used for pghook,
+ * making them invisible to /proc/<pid>/maps readers. View-only hide (no unmap) -- execution
+ * is unaffected. Idempotent (KPM replies "already present" on repeats). Returns #regions
+ * hidden. Call after tlf_init(); re-call periodically to catch lazily-created JIT memfds. */
+int kpm_hook_selfcloak(void)
+{
+    pthread_mutex_lock(&g_lock);
+    if (ensure_init_locked() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return 0; /* gated out or bridge off */
+    }
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    char line[320], cmd[64], out[256], path[256];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        uint64_t lo, hi;
+        char perms[8];
+        path[0] = 0;
+        /* addr-range, perms, offset, dev, inode, path (path may be space-padded/empty) */
+        if (sscanf(line, "%lx-%lx %7s %*x %*s %*u %255[^\n]", &lo, &hi, perms, path) < 3)
+            continue;
+        /* Frida footprint: any /memfd: mapping (on modern Android the agent .so and the
+         * Gum/ART JIT are all deleted memfds) plus explicit frida/gum/jvmti .so paths. This
+         * is the exact set the on-device PoC hid, after which the 易盾-guarded process, which
+         * otherwise died in ~1-2s, stayed alive. ART's own jit-cache is caught too -- harmless
+         * (a view-only hide), and the detector counts it anyway. */
+        if (!(strstr(path, "/memfd:") || strstr(path, "frida") || strstr(path, "gum") ||
+              strstr(path, "jvmti") || strstr(path, "openjdk")))
+            continue;
+        snprintf(cmd, sizeof cmd, "hidergn %d 0x%lx", g_pid, (unsigned long)lo);
+        bridge_cmd(cmd, out, sizeof out);
+        if (reply_ok(out)) n++;
+    }
+    fclose(f);
+    pthread_mutex_unlock(&g_lock);
+    return n;
+}
+
 int kpm_hook_init(void)
 {
     pthread_mutex_lock(&g_lock);
