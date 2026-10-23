@@ -81,3 +81,14 @@ TLF_EXPORT int tlf_selfcloak(void)
 {
     return kpm_hook_selfcloak();
 }
+
+/*
+ * Kernel-side auto-cloak (supersedes selfCloak): one call registers this process's mm so the
+ * KPM's show_map/show_smap hook drops every Frida-runtime line from /proc/<pid>/{maps,smaps}
+ * live -- no userspace maps walk, no periodic sweep, no startup / lazy-JIT window. Returns 0 on
+ * ok, <0 if the loaded KPM lacks the `autocloak` verb (JS falls back to selfCloak).
+ */
+TLF_EXPORT int tlf_autocloak(void)
+{
+    return kpm_hook_autocloak();
+}

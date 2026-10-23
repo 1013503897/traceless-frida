@@ -454,6 +454,27 @@ void kpm_hook_fshide_enable(void)
     pthread_mutex_unlock(&g_lock);
 }
 
+/* Enable KERNEL-SIDE auto-cloak of THIS process's Frida footprint: a single `autocloak <pid>`
+ * makes the KPM's show_map/show_smap hook drop every /memfd:/frida/gum/jvmti/openjdk line from
+ * this process's /proc/<pid>/{maps,smaps} LIVE -- no userspace maps walk, no periodic sweep, and
+ * NO startup window (lazily-created JIT memfds are hidden the moment they are read). Supersedes
+ * kpm_hook_selfcloak(). Idempotent. Returns 0 on ok, <0 otherwise (bridge off / KPM without the
+ * autocloak verb -- caller can fall back to selfCloak). */
+int kpm_hook_autocloak(void)
+{
+    pthread_mutex_lock(&g_lock);
+    if (ensure_init_locked() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    char cmd[48], out[256];
+    snprintf(cmd, sizeof cmd, "autocloak %d", g_pid);
+    bridge_cmd(cmd, out, sizeof out);
+    int ok = reply_ok(out);
+    pthread_mutex_unlock(&g_lock);
+    return ok ? 0 : -1;
+}
+
 /* Self-cloak THIS process's Frida-runtime footprint. traceless-frida keeps the HOOKED
  * TARGET byte-identical, but by documented scope does NOT hide Frida's own presence --
  * the injected agent (a random-named executable /memfd:), Gum's JIT /memfd:, and the

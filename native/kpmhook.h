@@ -69,6 +69,15 @@ void kpm_hook_fshide_enable(void);
 int kpm_hook_selfcloak(void);
 
 /*
+ * Kernel-side auto-cloak: one `autocloak <pid>` to the KPM makes show_map/show_smap drop every
+ * Frida-runtime line (/memfd: agent+JIT, gum/jvmti/openjdk) from this process's maps/smaps LIVE
+ * -- no userspace maps walk, no periodic sweep, no startup/lazy-JIT window. Supersedes
+ * kpm_hook_selfcloak(). Idempotent. Returns 0 on ok, <0 on failure (bridge off / KPM without the
+ * autocloak verb -- fall back to selfCloak).
+ */
+int kpm_hook_autocloak(void);
+
+/*
  * Probe the bridge and cache getpid(). Returns 0 if this process is gated-in AND the
  * bridge is live; <0 otherwise (gated out, or bridge not armed) -- in which case no
  * hook is attempted. Optional: kpm_inline_hooker() lazily runs this on first use.

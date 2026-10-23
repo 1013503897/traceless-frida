@@ -72,14 +72,21 @@ const Traceless = (function () {
             fshide: new NativeFunction(exp('tlf_fshide'), 'void', []),
             selfcloak: new NativeFunction(exp('tlf_selfcloak'), 'int', [])
         };
+        // Soft-resolve: an older .so (or KPM) may lack autocloak -> null, init() falls back to selfCloak.
+        const acp = (mod.findExportByName && mod.findExportByName('tlf_autocloak')) ||
+                    (mod.getExportByName && mod.getExportByName('tlf_autocloak'));
+        fn.autocloak = (acp && !acp.isNull()) ? new NativeFunction(acp, 'int', []) : null;
     }
 
     function keyOf(ptr) { return ptr.toString(); }
 
     // --- public API ---
 
-    // init({ so, ghost, fshide, selfCloak }) -> true; throws if the shpte bridge is not armed.
-    //   selfCloak: true            -> cloak once now + a periodic sweep every 300ms (default)
+    // init({ so, ghost, fshide, autocloak, selfCloak }) -> true; throws if the shpte bridge is off.
+    //   autocloak: true (default when either cloak opt is set) -> kernel-side cloak: one KPM call,
+    //              no userspace sweep, no startup / lazy-JIT window. Falls back to selfCloak if the
+    //              loaded KPM lacks the verb. autocloak:false forces the legacy userspace sweep.
+    //   selfCloak: true            -> (fallback) cloak once now + a periodic sweep every 300ms
     //   selfCloak: { intervalMs }  -> same, custom sweep period; intervalMs<=0 = one-shot only
     function init(opts) {
         opts = opts || {};
@@ -92,11 +99,18 @@ const Traceless = (function () {
                 '). Is shpte loaded and the bridge on? (shctl <KEY> control shpte probe/bridge)');
         }
         if (opts.fshide) fn.fshide();
-        if (opts.selfCloak) {
-            const iv = (typeof opts.selfCloak === 'object' && 'intervalMs' in opts.selfCloak)
-                ? opts.selfCloak.intervalMs : 300;
-            selfCloak();                              // cover the startup maps-scan window
-            if (iv > 0 && !cloakTimer) cloakTimer = setInterval(selfCloak, iv);
+        // Cloak Frida's own footprint. Prefer kernel-side autocloak (one call, no sweep, no
+        // startup / lazy-JIT window); fall back to the userspace selfCloak sweep only if the
+        // loaded KPM/backend lacks the autocloak verb. `autocloak:false` forces the legacy sweep.
+        if (opts.autocloak || opts.selfCloak) {
+            let done = false;
+            if (opts.autocloak !== false) done = (autocloak() === 0);
+            if (!done) {                              // fallback: userspace periodic sweep
+                const iv = (typeof opts.selfCloak === 'object' && 'intervalMs' in opts.selfCloak)
+                    ? opts.selfCloak.intervalMs : 300;
+                selfCloak();                          // cover the startup maps-scan window
+                if (iv > 0 && !cloakTimer) cloakTimer = setInterval(selfCloak, iv);
+            }
         }
         return true;
     }
@@ -108,6 +122,16 @@ const Traceless = (function () {
     function selfCloak() {
         requireArmed();
         return fn.selfcloak().valueOf();
+    }
+
+    // Kernel-side auto-cloak (supersedes selfCloak): registers this process with the KPM so
+    // show_map/show_smap drops every Frida-runtime line (/memfd: agent+JIT, gum/jvmti/openjdk)
+    // from its /proc/<pid>/{maps,smaps} live -- no userspace sweep, no startup / lazy-JIT window.
+    // Returns 0 on success, or -1 if the backend/KPM lacks it (init() falls back to selfCloak).
+    function autocloak() {
+        requireArmed();
+        if (!fn.autocloak) return -1;
+        return fn.autocloak().valueOf();
     }
 
     function requireArmed() {
@@ -223,7 +247,7 @@ const Traceless = (function () {
         return Array.from(hooks.values()).map(r => ({ target: r.target.toString(), backup: r.backup.toString() }));
     }
 
-    return { init, replace, attach, revert, dispose, list, selfCloak, SIG_GENERIC, get armed() { return armed; } };
+    return { init, replace, attach, revert, dispose, list, selfCloak, autocloak, SIG_GENERIC, get armed() { return armed; } };
 })();
 
 // Expose for REPL / cross-script (-l traceless.js -l yourscript.js) use.
